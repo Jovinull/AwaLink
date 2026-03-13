@@ -1,17 +1,17 @@
 """
 environment.py — Gymnasium Environment para Zelda: Link's Awakening via PyBoy.
 
-Implementação de RL de nível pesquisa com:
-  - Observação multimodal rica (Dict) com estado de jogo extensivo
-  - Reward shaping hierárquico: milestones > itens > exploração > combate
-  - Bônus de exploração baseado em contagem (1/sqrt(n)) — inspirado em Bellemare et al.
-  - Penalidade de tempo (time penalty) para criar urgência
-  - Delta-reward para estabilidade do treinamento (técnica PokemonRedExperiments V2)
-  - 4 frame stacks para captar dinâmica de combate em tempo real
+V2 — Reward Denso:
+  - Morte detectada via HP=0 (não pelo contador de save file)
+  - Rupees como sinal denso de combate/exploração (50x mais reward)
+  - HP recovery como sinal de combate bem-sucedido
+  - Transição de tela recompensada (não só telas "novas" nunca visitadas)
+  - Time penalty proporcional à inatividade (parado = penalidade alta)
+  - Kill counters + rupee burst como proxy de kills
+  - Bônus intrínseco de exploração 1/sqrt(n) (Bellemare et al.)
 
 Referências:
   - Bellemare et al. (2016): Count-based exploration with neural density models
-  - Pathak et al. (2017): Curiosity-driven exploration via self-supervised prediction
   - Schulman et al. (2017): PPO — Proximal Policy Optimization
   - Burda et al. (2019): Exploration by Random Network Distillation
 """
@@ -34,9 +34,6 @@ from global_map import (
     count_explored_screens,
 )
 
-# ===========================
-# AÇÕES — Zelda usa 7 botões (SELECT removido — pouco útil para RL)
-# ===========================
 VALID_ACTIONS = [
     WindowEvent.PRESS_ARROW_DOWN,
     WindowEvent.PRESS_ARROW_LEFT,
@@ -64,21 +61,7 @@ class ZeldaLinksAwakeningEnv(gym.Env):
     """
     Gymnasium Environment para treinar agente via RL em Zelda: Link's Awakening.
 
-    Observation Space (Dict):
-        screens:        (72, 80, 4) — 4 frames empilhados, escala de cinza
-        health:         (2,) — [hp_fraction, max_hearts_normalized]
-        position:       (ENC_FREQS*3,) — Fourier encoding de (x, y, room)
-        inventory:      (13,) — vetor binário de itens no inventário
-        equipment:      (6,) — [sword_lvl, shield_lvl, bracelet_lvl, flippers, potion, boots_equipped]
-        instruments:    (8,) — vetor binário de instrumentos coletados
-        overworld_map:  (16, 16, 1) — mapa de exploração do overworld
-        dungeon_state:  (8,) — [in_dungeon, dungeon_id, has_map, has_compass,
-                                 has_owl, has_nightmare_key, small_keys, grid_pos]
-        held_items:     (2,) — itens nos botões A e B (normalizados)
-        game_progress:  (6,) — [shells, leaves, trading_item, rupees, songs, kills]
-        recent_actions: (4,) — últimas 4 ações tomadas
-
-    Reward: delta-reward com reward shaping hierárquico e time penalty.
+    V2: Rewards densos para feedback rápido ao agente.
     """
 
     metadata = {"render_modes": ["human", "null"]}
@@ -93,10 +76,8 @@ class ZeldaLinksAwakeningEnv(gym.Env):
         self.output_shape = (config.SCREEN_SIZE[0], config.SCREEN_SIZE[1], self.frame_stacks)
         self.enc_freqs = config.ENC_FREQS
 
-        # Espaço de ações
         self.action_space = spaces.Discrete(len(VALID_ACTIONS))
 
-        # Espaço de observação multimodal
         self.observation_space = spaces.Dict({
             "screens": spaces.Box(
                 low=0, high=255, shape=self.output_shape, dtype=np.uint8
@@ -123,7 +104,6 @@ class ZeldaLinksAwakeningEnv(gym.Env):
             ),
         })
 
-        # Inicia o emulador
         window = "null" if self.headless else "SDL2"
         self.pyboy = PyBoy(
             config.ROM_PATH,
@@ -153,20 +133,23 @@ class ZeldaLinksAwakeningEnv(gym.Env):
         self.recent_actions = np.zeros((self.frame_stacks,), dtype=np.uint8)
 
         # Exploração
-        self.visited_positions = {}          # "room:x:y" -> count
-        self.visited_screens = set()         # room numbers visited
-        self.visited_dungeon_rooms = set()   # dungeon rooms visited
+        self.visited_positions = {}
+        self.visited_screens = set()
+        self.visited_dungeon_rooms = set()
         self.prev_explored_count = count_explored_screens(self._read_m)
+
+        # Posição atual (para detectar movimento)
+        self.prev_x = self._read_m(mem.LINK_X)
+        self.prev_y = self._read_m(mem.LINK_Y)
+        self.prev_room = self._read_m(mem.MAP_ROOM)
 
         # Inventário / progresso snapshot
         self.prev_inventory = self._get_inventory_set()
         self.prev_instruments = self._count_instruments()
-        self.prev_items_total = len(self.prev_inventory)
         self.prev_sword_level = self._read_m(mem.SWORD_LEVEL)
         self.prev_shield_level = self._read_m(mem.SHIELD_LEVEL)
         self.prev_bracelet_level = self._read_m(mem.BRACELET_LEVEL)
         self.prev_max_health = self._read_m(mem.MAX_HEALTH)
-        self.prev_health = self._get_health_fraction()
         self.prev_shells = self._read_m(mem.SECRET_SHELLS)
         self.prev_leaves = self._read_m(mem.GOLDEN_LEAVES)
         self.prev_trading = self._read_m(mem.TRADING_ITEM)
@@ -176,11 +159,18 @@ class ZeldaLinksAwakeningEnv(gym.Env):
         self.prev_kill_counter = self._get_kill_counter()
         self.prev_rupees = self._read_rupees()
 
+        # Saúde — usado para detecção de morte e HP recovery
+        self.prev_health_raw = self._read_m(mem.CURRENT_HEALTH)
+        self.prev_health_frac = self._get_health_fraction()
+        self.is_dead = False
+
         # Contadores
         self.died_count = 0
+        self.total_kills_detected = 0
         self.step_count = 0
         self.steps_on_current_screen = 0
         self.last_room = self._read_m(mem.MAP_ROOM)
+        self.screen_transitions = 0
 
         # Reward acumulativa
         self.total_reward = 0.0
@@ -188,6 +178,7 @@ class ZeldaLinksAwakeningEnv(gym.Env):
             "explore_screen": 0.0,
             "explore_room": 0.0,
             "explore_count": 0.0,
+            "screen_transition": 0.0,
             "instruments": 0.0,
             "new_items": 0.0,
             "equipment": 0.0,
@@ -200,7 +191,9 @@ class ZeldaLinksAwakeningEnv(gym.Env):
             "trading": 0.0,
             "kills": 0.0,
             "rupees": 0.0,
+            "hp_recovery": 0.0,
             "time": 0.0,
+            "idle": 0.0,
             "death": 0.0,
             "health_loss": 0.0,
             "stuck": 0.0,
@@ -216,18 +209,18 @@ class ZeldaLinksAwakeningEnv(gym.Env):
     def step(self, action):
         self._run_action(action)
         self._update_recent_actions(action)
-
-        # Tracking de posição
         self._update_position_tracking()
 
-        # Calcula reward
         step_reward = self._compute_reward()
         self.total_reward += step_reward
 
-        # Atualiza saúde para próximo step
-        self.prev_health = self._get_health_fraction()
+        # Atualiza estado anterior para próximo step
+        self.prev_health_raw = self._read_m(mem.CURRENT_HEALTH)
+        self.prev_health_frac = self._get_health_fraction()
+        self.prev_x = self._read_m(mem.LINK_X)
+        self.prev_y = self._read_m(mem.LINK_Y)
+        self.prev_room = self._read_m(mem.MAP_ROOM)
 
-        # Step counter
         self.step_count += 1
         truncated = self.step_count >= config.MAX_STEPS_PER_EPISODE
         terminated = False
@@ -271,15 +264,12 @@ class ZeldaLinksAwakeningEnv(gym.Env):
         self.recent_actions = np.roll(self.recent_actions, 1)
         self.recent_actions[0] = action
 
-    # --- Sub-observações ---
-
     def _get_health_obs(self):
         hp_frac = self._get_health_fraction()
         max_hearts = self._read_m(mem.MAX_HEALTH)
         return np.array([hp_frac, max_hearts / 14.0], dtype=np.float32)
 
     def _get_position_encoding(self):
-        """Fourier encoding de posição (x, y, room) — representação contínua e rica."""
         x = self._read_m(mem.LINK_X) / 160.0
         y = self._read_m(mem.LINK_Y) / 144.0
         room = self._read_m(mem.MAP_ROOM) / 255.0
@@ -290,7 +280,6 @@ class ZeldaLinksAwakeningEnv(gym.Env):
         ])
 
     def _get_inventory_binary(self):
-        """Vetor binário: 1 se o item existe no inventário, 0 caso contrário."""
         inv = self._get_inventory_set()
         return np.array(
             [1 if item_id in inv else 0 for item_id in mem.ALL_ITEMS],
@@ -298,7 +287,6 @@ class ZeldaLinksAwakeningEnv(gym.Env):
         )
 
     def _get_equipment_obs(self):
-        """Níveis de equipamento normalizados [0, 1]."""
         sword = self._read_m(mem.SWORD_LEVEL) / 2.0
         shield = self._read_m(mem.SHIELD_LEVEL) / 3.0
         bracelet = self._read_m(mem.BRACELET_LEVEL) / 2.0
@@ -311,19 +299,16 @@ class ZeldaLinksAwakeningEnv(gym.Env):
         )
 
     def _get_instruments_binary(self):
-        """Vetor binário dos 8 instrumentos coletados."""
         return np.array([
             1 if self._read_m(mem.INSTRUMENTS_START + i) == mem.INSTRUMENT_COLLECTED else 0
             for i in range(mem.NUM_INSTRUMENTS)
         ], dtype=np.int8)
 
     def _get_overworld_map_obs(self):
-        """Mapa 16x16 de exploração do overworld lido diretamente da RAM."""
         explore = build_overworld_exploration_map(self._read_m)
         return explore[:, :, np.newaxis]
 
     def _get_dungeon_state_obs(self):
-        """Estado do dungeon atual normalizado."""
         cat = self._read_m(mem.MAP_CATEGORY)
         in_dungeon = float(cat == 0x01)
         dungeon_id = self._read_m(mem.MAP_DUNGEON_ID) / 9.0
@@ -339,67 +324,95 @@ class ZeldaLinksAwakeningEnv(gym.Env):
         )
 
     def _get_held_items_obs(self):
-        """Itens nos botões A e B normalizados."""
         a = self._read_m(mem.HELD_ITEM_A) / 13.0
         b = self._read_m(mem.HELD_ITEM_B) / 13.0
         return np.array([a, b], dtype=np.float32)
 
     def _get_game_progress_obs(self):
-        """Progresso geral do jogo normalizado."""
         shells = min(self._read_m(mem.SECRET_SHELLS), 26) / 26.0
         leaves = min(self._read_m(mem.GOLDEN_LEAVES), 6) / 6.0
         trading = self._read_m(mem.TRADING_ITEM) / 14.0
         rupees = min(self._read_rupees(), 999) / 999.0
         songs = bin(self._read_m(mem.OCARINA_SONGS) & 0x07).count("1") / 3.0
-        kills = min(
-            self._read_m(mem.PIECE_OF_POWER_KILLS) + self._read_m(mem.GUARDIAN_ACORN_KILLS),
-            50,
-        ) / 50.0
+        kills = min(self.total_kills_detected, 100) / 100.0
         return np.array(
             [shells, leaves, trading, rupees, songs, kills],
             dtype=np.float32,
         )
 
     # ===========================
-    # REWARD SYSTEM
+    # REWARD SYSTEM V2 — DENSO
     # ===========================
 
     def _compute_reward(self) -> float:
         """
-        Sistema de recompensa hierárquico com delta-reward.
+        Sistema de recompensa V2 — Rewards densos.
 
-        Hierarquia (importância):
-        1. Instrumentos (objetivo principal — zerar o jogo)
-        2. Novos itens e key items
-        3. Exploração de telas/salas novas
-        4. Upgrades de equipamento e heart containers
-        5. Colecionáveis e side quests
-        6. Combate
-        7. Time penalty (urgência)
-        8. Penalidades (morte, dano, stuck)
+        Prioridade de FREQUÊNCIA (não só importância):
+        1. Movimento e transição de tela (~todo step)
+        2. Rupees e HP recovery (~a cada 10-50 steps)
+        3. Kill counters (~a cada 20-100 steps)
+        4. Exploração de telas novas (~a cada minuto)
+        5. Itens e milestones (~raro)
+        6. Penalidades (morte, stuck, inatividade)
         """
         r = 0.0
+        cur_health_raw = self._read_m(mem.CURRENT_HEALTH)
+        cur_health_frac = self._get_health_fraction()
+        cur_room = self._read_m(mem.MAP_ROOM)
+        cur_x = self._read_m(mem.LINK_X)
+        cur_y = self._read_m(mem.LINK_Y)
 
-        # --- 1. INSTRUMENTOS (objetivo principal) ---
-        cur_instruments = self._count_instruments()
-        delta_inst = cur_instruments - self.prev_instruments
-        if delta_inst > 0:
-            inst_reward = delta_inst * config.INSTRUMENT_REWARD
-            r += inst_reward
-            self.cumulative_rewards["instruments"] += inst_reward
-        self.prev_instruments = cur_instruments
+        # ---- DETECÇÃO DE MORTE (via HP=0) ----
+        if cur_health_raw == 0 and self.prev_health_raw > 0:
+            self.is_dead = True
+            self.died_count += 1
+            r += config.DEATH_PENALTY
+            self.cumulative_rewards["death"] += config.DEATH_PENALTY
 
-        # --- 2. NOVOS ITENS ---
-        cur_inventory = self._get_inventory_set()
-        new_items = cur_inventory - self.prev_inventory
-        if new_items:
-            item_reward = len(new_items) * config.NEW_ITEM_REWARD
-            r += item_reward
-            self.cumulative_rewards["new_items"] += item_reward
-        self.prev_inventory = cur_inventory
+        # Detectar respawn: HP volta após morte
+        if self.is_dead and cur_health_raw > 0:
+            self.is_dead = False
 
-        # --- 3. EXPLORAÇÃO ---
-        # 3a. Novas telas do overworld visitadas
+        # Durante Game Over / tela de morte, não computar outros rewards
+        if self.is_dead:
+            r += config.TIME_PENALTY_BASE
+            self.cumulative_rewards["time"] += config.TIME_PENALTY_BASE
+            return r * config.REWARD_SCALE
+
+        # ---- 1. TRANSIÇÃO DE TELA (DENSO — incentiva movimento entre telas) ----
+        if cur_room != self.prev_room:
+            r += config.SCREEN_TRANSITION_REWARD
+            self.cumulative_rewards["screen_transition"] += config.SCREEN_TRANSITION_REWARD
+            self.screen_transitions += 1
+
+        # ---- 2. RUPEES (DENSO — sinal mais frequente de progresso) ----
+        cur_rupees = self._read_rupees()
+        delta_rupees = cur_rupees - self.prev_rupees
+        if delta_rupees > 0:
+            rupee_reward = delta_rupees * config.RUPEE_REWARD_SCALE
+            r += rupee_reward
+            self.cumulative_rewards["rupees"] += rupee_reward
+        self.prev_rupees = cur_rupees
+
+        # ---- 3. HP RECOVERY (DENSO — pegar corações = combate/exploração) ----
+        if cur_health_frac > self.prev_health_frac and self.prev_health_frac > 0:
+            hp_gained = cur_health_frac - self.prev_health_frac
+            recovery_reward = hp_gained * config.HEALTH_RECOVERY_REWARD
+            r += recovery_reward
+            self.cumulative_rewards["hp_recovery"] += recovery_reward
+
+        # ---- 4. COMBATE — Kill counters ----
+        cur_kills = self._get_kill_counter()
+        delta_kills = cur_kills - self.prev_kill_counter
+        if delta_kills > 0:
+            kill_reward = delta_kills * config.KILL_BONUS
+            r += kill_reward
+            self.cumulative_rewards["kills"] += kill_reward
+            self.total_kills_detected += delta_kills
+        self.prev_kill_counter = cur_kills
+
+        # ---- 5. EXPLORAÇÃO DE TELAS NOVAS (overworld) ----
         cur_explored = count_explored_screens(self._read_m)
         delta_screens = cur_explored - self.prev_explored_count
         if delta_screens > 0:
@@ -408,7 +421,7 @@ class ZeldaLinksAwakeningEnv(gym.Env):
             self.cumulative_rewards["explore_screen"] += screen_reward
         self.prev_explored_count = cur_explored
 
-        # 3b. Novas salas de dungeon
+        # Novas salas de dungeon
         if self._read_m(mem.MAP_CATEGORY) == 0x01:
             room = self._read_m(mem.MAP_ROOM)
             dungeon_id = self._read_m(mem.MAP_DUNGEON_ID)
@@ -418,7 +431,7 @@ class ZeldaLinksAwakeningEnv(gym.Env):
                 r += config.EXPLORE_NEW_ROOM
                 self.cumulative_rewards["explore_room"] += config.EXPLORE_NEW_ROOM
 
-        # 3c. Bônus intrínseco baseado em contagem (Bellemare et al.)
+        # Bônus intrínseco 1/sqrt(n) (Bellemare et al.)
         pos_key = self._get_position_key()
         visit_count = self.visited_positions.get(pos_key, 0)
         if visit_count > 0:
@@ -426,7 +439,24 @@ class ZeldaLinksAwakeningEnv(gym.Env):
             r += count_bonus
             self.cumulative_rewards["explore_count"] += count_bonus
 
-        # --- 4. UPGRADES DE EQUIPAMENTO ---
+        # ---- 6. INSTRUMENTOS (milestone principal) ----
+        cur_instruments = self._count_instruments()
+        delta_inst = cur_instruments - self.prev_instruments
+        if delta_inst > 0:
+            r += delta_inst * config.INSTRUMENT_REWARD
+            self.cumulative_rewards["instruments"] += delta_inst * config.INSTRUMENT_REWARD
+        self.prev_instruments = cur_instruments
+
+        # ---- 7. NOVOS ITENS ----
+        cur_inventory = self._get_inventory_set()
+        new_items = cur_inventory - self.prev_inventory
+        if new_items:
+            item_reward = len(new_items) * config.NEW_ITEM_REWARD
+            r += item_reward
+            self.cumulative_rewards["new_items"] += item_reward
+        self.prev_inventory = cur_inventory
+
+        # ---- 8. UPGRADES DE EQUIPAMENTO ----
         cur_sword = self._read_m(mem.SWORD_LEVEL)
         if cur_sword > self.prev_sword_level:
             r += config.EQUIPMENT_UPGRADE
@@ -445,7 +475,7 @@ class ZeldaLinksAwakeningEnv(gym.Env):
             self.cumulative_rewards["equipment"] += config.EQUIPMENT_UPGRADE
         self.prev_bracelet_level = cur_bracelet
 
-        # --- Heart containers ---
+        # Heart containers
         cur_max_hp = self._read_m(mem.MAX_HEALTH)
         if cur_max_hp > self.prev_max_health:
             hearts_reward = (cur_max_hp - self.prev_max_health) * config.HEART_CONTAINER
@@ -453,98 +483,68 @@ class ZeldaLinksAwakeningEnv(gym.Env):
             self.cumulative_rewards["hearts"] += hearts_reward
         self.prev_max_health = cur_max_hp
 
-        # --- 5. DUNGEON KEYS ---
+        # ---- 9. DUNGEON KEYS ----
         cur_dk = self._count_dungeon_entrance_keys()
         delta_dk = cur_dk - self.prev_dungeon_keys_total
         if delta_dk > 0:
-            dk_reward = delta_dk * config.DUNGEON_KEY_REWARD
-            r += dk_reward
-            self.cumulative_rewards["dungeon_keys"] += dk_reward
+            r += delta_dk * config.DUNGEON_KEY_REWARD
+            self.cumulative_rewards["dungeon_keys"] += delta_dk * config.DUNGEON_KEY_REWARD
         self.prev_dungeon_keys_total = cur_dk
 
-        # --- Small keys ---
         cur_sk = self._read_m(mem.DUNGEON_SMALL_KEYS)
         delta_sk = cur_sk - self.prev_small_keys
         if delta_sk > 0:
-            sk_reward = delta_sk * config.SMALL_KEY_REWARD
-            r += sk_reward
-            self.cumulative_rewards["small_keys"] += sk_reward
+            r += delta_sk * config.SMALL_KEY_REWARD
+            self.cumulative_rewards["small_keys"] += delta_sk * config.SMALL_KEY_REWARD
         self.prev_small_keys = cur_sk
 
-        # --- Dungeon items (map, compass, owl, nightmare key) ---
+        # Dungeon items (map, compass, owl beak, nightmare key)
         cur_di = self._count_current_dungeon_items()
         delta_di = cur_di - self.prev_dungeon_items
         if delta_di > 0:
-            di_reward = delta_di * config.DUNGEON_ITEM_REWARD
-            r += di_reward
-            self.cumulative_rewards["dungeon_items"] += di_reward
+            r += delta_di * config.DUNGEON_ITEM_REWARD
+            self.cumulative_rewards["dungeon_items"] += delta_di * config.DUNGEON_ITEM_REWARD
         self.prev_dungeon_items = cur_di
 
-        # --- 6. COLECIONÁVEIS ---
+        # ---- 10. COLECIONÁVEIS ----
         cur_shells = self._read_m(mem.SECRET_SHELLS)
         delta_shells = cur_shells - self.prev_shells
         if delta_shells > 0:
-            shell_reward = delta_shells * config.SHELL_REWARD
-            r += shell_reward
-            self.cumulative_rewards["shells"] += shell_reward
+            r += delta_shells * config.SHELL_REWARD
+            self.cumulative_rewards["shells"] += delta_shells * config.SHELL_REWARD
         self.prev_shells = cur_shells
 
         cur_leaves = self._read_m(mem.GOLDEN_LEAVES)
         delta_leaves = cur_leaves - self.prev_leaves
         if delta_leaves > 0:
-            leaf_reward = delta_leaves * config.GOLDEN_LEAF_REWARD
-            r += leaf_reward
-            self.cumulative_rewards["leaves"] += leaf_reward
+            r += delta_leaves * config.GOLDEN_LEAF_REWARD
+            self.cumulative_rewards["leaves"] += delta_leaves * config.GOLDEN_LEAF_REWARD
         self.prev_leaves = cur_leaves
 
         cur_trading = self._read_m(mem.TRADING_ITEM)
         delta_trading = cur_trading - self.prev_trading
         if delta_trading > 0:
-            trade_reward = delta_trading * config.TRADING_STEP_REWARD
-            r += trade_reward
-            self.cumulative_rewards["trading"] += trade_reward
+            r += delta_trading * config.TRADING_STEP_REWARD
+            self.cumulative_rewards["trading"] += delta_trading * config.TRADING_STEP_REWARD
         self.prev_trading = cur_trading
 
-        # --- 7. COMBATE (kill counters) ---
-        cur_kills = self._get_kill_counter()
-        delta_kills = cur_kills - self.prev_kill_counter
-        if delta_kills > 0:
-            kill_reward = delta_kills * config.KILL_BONUS
-            r += kill_reward
-            self.cumulative_rewards["kills"] += kill_reward
-        self.prev_kill_counter = cur_kills
-
-        # --- 8. RUPEES ---
-        cur_rupees = self._read_rupees()
-        delta_rupees = cur_rupees - self.prev_rupees
-        if delta_rupees > 0:
-            rupee_reward = delta_rupees * config.RUPEE_REWARD_SCALE
-            r += rupee_reward
-            self.cumulative_rewards["rupees"] += rupee_reward
-        self.prev_rupees = cur_rupees
-
-        # --- 9. TIME PENALTY ---
-        r += config.TIME_PENALTY
-        self.cumulative_rewards["time"] += config.TIME_PENALTY
-
-        # --- 10. DEATH PENALTY ---
-        cur_deaths = self._read_m(mem.DEATH_COUNT_SLOT1)
-        new_deaths = cur_deaths - self.died_count
-        if new_deaths > 0:
-            death_cost = new_deaths * config.DEATH_PENALTY
-            r += death_cost
-            self.cumulative_rewards["death"] += death_cost
-            self.died_count = cur_deaths
-
-        # --- 11. HEALTH LOSS PENALTY ---
-        cur_health = self._get_health_fraction()
-        if cur_health < self.prev_health and cur_health > 0:
-            hp_delta = self.prev_health - cur_health
-            hp_cost = hp_delta * config.HEALTH_LOSS_PENALTY * 10
+        # ---- 11. HEALTH LOSS (tomar dano) ----
+        if cur_health_frac < self.prev_health_frac and cur_health_raw > 0:
+            hp_lost = self.prev_health_frac - cur_health_frac
+            hp_cost = hp_lost * config.HEALTH_LOSS_PENALTY
             r += hp_cost
             self.cumulative_rewards["health_loss"] += hp_cost
 
-        # --- 12. STUCK PENALTY ---
+        # ---- 12. TIME PENALTY + IDLE PENALTY ----
+        moved = (cur_x != self.prev_x or cur_y != self.prev_y or cur_room != self.prev_room)
+        if moved:
+            r += config.TIME_PENALTY_BASE
+            self.cumulative_rewards["time"] += config.TIME_PENALTY_BASE
+        else:
+            r += config.IDLE_PENALTY
+            self.cumulative_rewards["idle"] += config.IDLE_PENALTY
+
+        # ---- 13. STUCK PENALTY ----
         stuck_cost = self._get_stuck_penalty()
         r += stuck_cost
         self.cumulative_rewards["stuck"] += stuck_cost
@@ -576,11 +576,10 @@ class ZeldaLinksAwakeningEnv(gym.Env):
 
     def _get_health_fraction(self):
         current = self._read_m(mem.CURRENT_HEALTH)
-        maximum = self._read_m(mem.MAX_HEALTH) * 8  # MAX_HEALTH é contagem de hearts
+        maximum = self._read_m(mem.MAX_HEALTH) * 8
         return current / max(maximum, 1)
 
     def _read_rupees(self):
-        """Lê rupees em formato BCD."""
         high = self._read_m(mem.RUPEES_HIGH)
         low = self._read_m(mem.RUPEES_LOW)
         try:
@@ -589,7 +588,6 @@ class ZeldaLinksAwakeningEnv(gym.Env):
             return 0
 
     def _get_inventory_set(self):
-        """Retorna set de item IDs presentes no inventário + held items."""
         items = set()
         for addr in range(mem.INVENTORY_START, mem.INVENTORY_END + 1):
             val = self._read_m(addr)
@@ -660,7 +658,6 @@ class ZeldaLinksAwakeningEnv(gym.Env):
             self.steps_on_current_screen += 1
 
     def _get_stuck_penalty(self):
-        """Penalidade se ficar preso na mesma tela sem sair."""
         if self.steps_on_current_screen > config.STUCK_SAME_SCREEN_STEPS:
             return config.STUCK_PENALTY
 
@@ -681,6 +678,7 @@ class ZeldaLinksAwakeningEnv(gym.Env):
             "screens_explored": self.prev_explored_count,
             "total_screens_visited": len(self.visited_screens),
             "dungeon_rooms": len(self.visited_dungeon_rooms),
+            "screen_transitions": self.screen_transitions,
             "instruments": self._count_instruments(),
             "inventory_count": len(self._get_inventory_set()),
             "sword_level": self._read_m(mem.SWORD_LEVEL),
@@ -688,6 +686,7 @@ class ZeldaLinksAwakeningEnv(gym.Env):
             "max_hearts": self._read_m(mem.MAX_HEALTH),
             "hp_fraction": self._get_health_fraction(),
             "deaths": self.died_count,
+            "kills": self.total_kills_detected,
             "shells": self._read_m(mem.SECRET_SHELLS),
             "leaves": self._read_m(mem.GOLDEN_LEAVES),
             "trading_item": self._read_m(mem.TRADING_ITEM),

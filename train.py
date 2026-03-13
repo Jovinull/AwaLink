@@ -82,14 +82,15 @@ class ZeldaLogCallback(BaseCallback):
                 f"[EP {self.episode_count:>4}] "
                 f"Env {i:>2}/{self.num_envs} | "
                 f"Steps: {self.num_timesteps:>9,} | "
-                f"Screens: {screens:>3} | "
-                f"Instruments: {instruments}/8 | "
+                f"Scr: {screens:>3} | "
+                f"Trans: {info.get('screen_transitions', 0):>4} | "
+                f"Inst: {instruments}/8 | "
                 f"Items: {info.get('inventory_count', 0):>2} | "
-                f"Sword: L{info.get('sword_level', 0)} | "
-                f"Hearts: {info.get('max_hearts', 0):>2} | "
-                f"HP: {info.get('hp_fraction', 0):.0%} | "
+                f"Kills: {info.get('kills', 0):>3} | "
                 f"Deaths: {info.get('deaths', 0):>2} | "
-                f"Reward: {info.get('total_reward', 0):>8.1f} | "
+                f"Rupees: {info.get('rupees', 0):>3} | "
+                f"HP: {info.get('hp_fraction', 0):.0%} | "
+                f"R: {info.get('total_reward', 0):>8.1f} | "
                 f"FPS: {fps:>5.0f}"
             )
 
@@ -117,6 +118,8 @@ class ZeldaLogCallback(BaseCallback):
             # --- TensorBoard: Saúde e Sobrevivência ---
             self.logger.record("zelda/hp_fraction", info.get("hp_fraction", 0))
             self.logger.record("zelda/deaths", info.get("deaths", 0))
+            self.logger.record("zelda/kills", info.get("kills", 0))
+            self.logger.record("zelda/screen_transitions", info.get("screen_transitions", 0))
 
             # --- TensorBoard: Componentes de Reward ---
             self.logger.record("zelda/total_reward", info.get("total_reward", 0))
@@ -124,10 +127,11 @@ class ZeldaLogCallback(BaseCallback):
 
             for key in [
                 "explore_screen", "explore_room", "explore_count",
-                "instruments", "new_items", "equipment", "hearts",
-                "dungeon_keys", "small_keys", "dungeon_items",
-                "shells", "leaves", "trading", "kills", "rupees",
-                "time", "death", "health_loss", "stuck",
+                "screen_transition", "instruments", "new_items",
+                "equipment", "hearts", "dungeon_keys", "small_keys",
+                "dungeon_items", "shells", "leaves", "trading",
+                "kills", "rupees", "hp_recovery",
+                "time", "idle", "death", "health_loss", "stuck",
             ]:
                 val = info.get(f"rew_{key}", 0)
                 self.logger.record(f"reward/{key}", val)
