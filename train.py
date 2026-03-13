@@ -178,6 +178,14 @@ def main():
 
     num_envs = args.num_envs
 
+    if args.fresh:
+        import shutil
+        for d in (config.MODEL_DIR, config.LOG_DIR):
+            if os.path.exists(d):
+                shutil.rmtree(d)
+                os.makedirs(d, exist_ok=True)
+        print("[FRESH] Modelos e logs antigos removidos.\n")
+
     print("=" * 70)
     print("   ZELDA: LINK'S AWAKENING — RL TRAINING V3")
     print("=" * 70)
