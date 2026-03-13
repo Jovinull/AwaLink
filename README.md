@@ -9,10 +9,10 @@ Agente de RL treinado com **PPO (Proximal Policy Optimization)** para jogar **Th
 | Algoritmo RL | PPO (Stable-Baselines3) |
 | Emulador | PyBoy (Game Boy) |
 | Observação | MultiInputPolicy (Dict) — tela + estado de jogo |
-| Normalização | VecNormalize (obs + reward) |
+| Normalização | VecNormalize (apenas observações escalares) |
 | Monitoramento | TensorBoard |
 
-## Observação do Agente
+## Observação do Agente (V3)
 
 O agente recebe uma observação multimodal rica:
 
@@ -23,14 +23,16 @@ O agente recebe uma observação multimodal rica:
 - **equipment** — níveis de sword/shield/bracelet + flags
 - **instruments** — 8 instrumentos dos dungeons
 - **overworld_map** — mapa 16×16 de exploração do overworld
-- **dungeon_state** — estado do dungeon atual
+- **dungeon_state** — estado do dungeon atual (8 features)
 - **held_items** — itens equipados nos botões A e B
 - **game_progress** — shells, leaves, trading, rupees, songs, kills
+- **combat_info** *(V3)* — entidades ativas na tela, power-up, direção e terreno do Link
+- **ammo** *(V3)* — bombas/flechas/pó normalizados pela capacidade máxima
 - **recent_actions** — últimas 4 ações
 
-## Sistema de Recompensas
+## Sistema de Recompensas (V3)
 
-Reward shaping hierárquico com delta-reward e sinais densos de aprendizado:
+Reward shaping hierárquico com delta-reward e sinais densos:
 
 | Prioridade | Componente | Reward |
 |---|---|---|
@@ -46,36 +48,50 @@ Reward shaping hierárquico com delta-reward e sinais densos de aprendizado:
 | 10 | Golden leaf | +2.0 |
 | 11 | Small key | +1.5 |
 | 12 | Secret shell | +1.0 |
-| 13 | Transição de tela | +0.15 |
-| 14 | Recuperar HP | +0.5 por fração de HP |
-| 15 | Rupees | +0.05 por rupee |
-| 16 | Kill counter | +0.3 |
+| 13 | Dungeon flag bit (progresso) | +0.5 |
+| 14 | Interação com o mundo (tiles) | +0.3 |
+| 15 | Kill counter | +0.3 |
+| 16 | Transição de tela (anti-osc.) | +0.15 |
+| 17 | Recuperar HP | +0.5 × fração |
+| 18 | Rupees | +0.05 × quantidade |
 | - | Time penalty base | -0.0003 |
 | - | Inatividade | -0.002 |
 | - | Morte | -3.0 |
-| - | Perder HP | -0.5 por fração de HP |
+| - | Perder HP | -0.5 × fração |
 | - | Stuck (mesmo lugar) | -0.15 |
 
-Bônus intrínseco de exploração baseado em contagem: `0.02 / sqrt(visitas)` (Bellemare et al., 2016).
+Bônus intrínseco: `0.02 / sqrt(visitas)`, cortado após 100 visitas (Bellemare et al., 2016).
 
-### Filosofia da V2
+### Filosofia da V3
 
-- O agente precisa receber sinais úteis com frequência, não apenas quando encontra itens raros.
-- Rewards densos como `rupees`, `hp_recovery` e `screen_transition` ensinam combate, coleta e movimentação.
-- Milestones como `instrumentos`, `novos itens` e `heart containers` continuam com peso alto para direcionar o objetivo final.
-- Mortes agora são detectadas em tempo real via `HP == 0`, sem depender do contador persistente do save file.
+**Episódios curtos** (~30k steps ≈ 8 min de jogo) para que o agente veja muito mais resets ao longo do treinamento. Com 20M steps e 8 envs, cada env faz ~80 episódios em vez de ~25.
+
+**Anti-oscillation**: transições de tela só são recompensadas se a room destino não está nas últimas 3 rooms visitadas. Impede o agente de exploitar A→B→A→B infinitamente.
+
+**Auto Game Over**: quando o agente morre (HP=0), após a animação de morte o environment automaticamente pressiona A para navegar o menu de Game Over e selecionar "Continue". Economiza ~200 steps por morte.
+
+**World Interaction**: monitora mudanças nos tile data carregados (D700-D79B). Quando tiles mudam (abrir baú, cortar grama, matar inimigo na tela), o agente recebe +0.3.
+
+**Dungeon Flags**: monitora os bits em DB16-DB3D que representam progresso nos dungeons (baús, portas, switches). Cada novo bit setado = +0.5.
+
+**Sem VecNormalize reward**: a normalização de reward com clipping destruía a hierarquia (instrumento +50 era clipado ao mesmo valor que 5 rupees). Agora os rewards são manuais e preservam a escala relativa.
+
+**Combat awareness**: o agente agora vê quantas entidades estão ativas na tela, se Piece of Power está ativo, e seu estado de terreno, permitindo decisões de combate informadas.
 
 ## Técnicas Avançadas
 
-- **VecNormalize**: normalização de observações e rewards para estabilidade
-- **Count-based exploration**: bônus intrínseco para estados pouco visitados
-- **Time penalty adaptativo**: penalidade baixa ao se mover e maior ao ficar parado
+- **VecNormalize seletivo**: normaliza apenas observações escalares (health, position, etc.); screens e overworld_map mantêm valores brutos (CombinedExtractor divide por 255 automaticamente)
+- **Count-based exploration** com cutoff (Bellemare et al.): bônus intrínseco para estados pouco visitados, cortado após 100 visitas para reduzir ruído
+- **Anti-oscillation cooldown**: evita exploiting de screen transitions repetidas
+- **Auto Game Over navigation**: reduz tempo perdido em menus pós-morte
+- **World interaction detection**: hash dos tile data como sinal de interação com o ambiente
+- **Dungeon flag tracking**: progresso granular em dungeons via bitflags
+- **BCD parsing robusto**: decodificação de valores BCD (rupees, ammo) com clamp de dígitos inválidos
+- **N_EPOCHS=2**: reduz overfitting no rollout com reward ruidoso
 - **Delta-reward**: recompensa = diferença entre estado atual e anterior
 - **GAE (λ=0.95)**: Generalized Advantage Estimation para menor variância
-- **Linear LR decay**: learning rate decai linearmente até zero
 - **High gamma (0.998)**: desconto alto para objetivos de longo prazo
 - **4 frame stacks**: captura dinâmica de combate em tempo real
-- **Reward denso**: rupees, recuperação de HP e transições de tela ajudam o agente a aprender mais cedo
 
 ## Setup
 
@@ -105,40 +121,33 @@ python train.py
 
 Opções:
 ```bash
-python train.py --fresh              # Treino do zero
+python train.py --fresh              # Treino do zero (OBRIGATÓRIO após mudanças V3)
 python train.py --timesteps 5000000  # Definir timesteps
 python train.py --num-envs 4         # Número de processos
 ```
 
-Se você alterar significativamente o sistema de rewards, use:
-
-```bash
-python train.py --fresh
-```
-
-Isso evita continuar um modelo treinado com uma função de recompensa antiga.
+> **IMPORTANTE**: Como V3 muda observação e rewards, use `--fresh` na primeira execução após atualizar!
 
 ### 5. Monitorar com TensorBoard
 
-O TensorBoard deve ser usado principalmente **durante o treino**. Ele lê os logs gerados pelo `train.py` em tempo real, então você pode deixar o treinamento rodando em um terminal e o TensorBoard em outro.
+O TensorBoard deve ser usado **durante o treino**. Ele lê os logs gerados pelo `train.py` em tempo real. Deixe o treinamento rodando em um terminal e o TensorBoard em outro.
 
 ```bash
 tensorboard --logdir logs/
 ```
 
+Acesse `http://localhost:6006` no navegador.
+
 Métricas disponíveis:
 - `zelda/instruments` — instrumentos coletados (progresso principal)
 - `zelda/screens_explored` — telas do overworld visitadas
-- `zelda/screen_transitions` — trocas de tela, útil para validar movimento real
+- `zelda/screen_transitions` — trocas de tela
+- `zelda/world_interactions` — interações com tiles do mapa
+- `zelda/dungeon_flag_bits` — progresso em dungeons
 - `zelda/inventory_count` — itens no inventário
-- `zelda/sword_level`, `zelda/shield_level` — níveis de equipamento
-- `zelda/deaths` — mortes
-- `zelda/kills` — kills detectadas
+- `zelda/entities` — entidades ativas na tela
+- `zelda/deaths`, `zelda/kills` — mortes e kills
 - `zelda/total_reward` — recompensa total
-- `reward/rupees` — coleta de rupees
-- `reward/hp_recovery` — recuperação de vida
-- `reward/screen_transition` — reward por movimentação entre telas
-- `reward/idle` — penalidade por inatividade
 - `reward/*` — componentes individuais de reward
 
 ### 6. Assistir o agente jogar

@@ -9,7 +9,6 @@ Uso:
 import argparse
 import os
 import glob
-import time
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
@@ -23,10 +22,8 @@ def find_best_model() -> str | None:
     final = os.path.join(config.MODEL_DIR, "zelda_ppo_final.zip")
     if os.path.exists(final):
         return final
-
     if not os.path.exists(config.MODEL_DIR):
         return None
-
     zips = glob.glob(os.path.join(config.MODEL_DIR, "zelda_ppo_*.zip"))
     if not zips:
         return None
@@ -45,7 +42,6 @@ def find_latest_vecnormalize() -> str | None:
 
 
 def create_save_state():
-    """Jogue manualmente para criar o save state inicial."""
     from pyboy import PyBoy
 
     print("=" * 60)
@@ -86,16 +82,14 @@ def create_save_state():
 
 
 def watch_agent(model_path: str):
-    """Assiste o agente treinado jogar via SDL2."""
     print("=" * 60)
-    print("   ZELDA: LINK'S AWAKENING — ASSISTINDO O AGENTE")
+    print("   ZELDA: LINK'S AWAKENING — ASSISTINDO O AGENTE (V3)")
     print("=" * 60)
     print(f"  Modelo: {model_path}\n")
 
     env = ZeldaLinksAwakeningEnv(render_mode="human")
     env.pyboy.set_emulation_speed(1)
 
-    # Wrap com VecNormalize se disponível (para manter consistência com treino)
     vecnorm_path = find_latest_vecnormalize()
     vec_env = DummyVecEnv([lambda: env])
 
@@ -124,10 +118,14 @@ def watch_agent(model_path: str):
                 i = info[0] if isinstance(info, list) else info
                 print(
                     f"  Step {step_count:>6} | "
-                    f"Reward: {total_reward:>8.1f} | "
-                    f"Screens: {i.get('screens_explored', 0):>3} | "
-                    f"Instruments: {i.get('instruments', 0)}/8 | "
+                    f"R: {total_reward:>8.1f} | "
+                    f"Scr: {i.get('screens_explored', 0):>3} | "
+                    f"Trans: {i.get('screen_transitions', 0):>4} | "
+                    f"WI: {i.get('world_interactions', 0):>3} | "
+                    f"Inst: {i.get('instruments', 0)}/8 | "
                     f"Items: {i.get('inventory_count', 0):>2} | "
+                    f"Kills: {i.get('kills', 0):>3} | "
+                    f"Ent: {i.get('entities', 0):>2} | "
                     f"HP: {i.get('hp_fraction', 0):.0%} | "
                     f"Deaths: {i.get('deaths', 0)}"
                 )
@@ -147,9 +145,7 @@ def watch_agent(model_path: str):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Assistir o Agente Zelda jogar"
-    )
+    parser = argparse.ArgumentParser(description="Assistir o Agente Zelda jogar")
     parser.add_argument("--model", type=str, default=None)
     parser.add_argument("--create-save", action="store_true")
     args = parser.parse_args()

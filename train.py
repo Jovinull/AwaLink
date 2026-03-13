@@ -1,12 +1,11 @@
 """
 train.py — Treinamento Paralelo com PPO para Zelda: Link's Awakening.
 
-Técnicas avançadas de RL:
-  - PPO com GAE (Schulman et al., 2017)
-  - VecNormalize para normalização de observações e rewards
-  - TensorBoard com métricas detalhadas de progresso do jogo
-  - Linear LR decay para convergência suave
-  - Checkpointing automático com salvamento de normalizador
+V3:
+  - Normalização apenas em observações Box escalares (sem screens/overworld_map)
+  - Sem normalização de reward (escala manual preserva hierarquia)
+  - Métricas completas no TensorBoard (world interactions, entities, dungeon flags)
+  - Episódios curtos (~30k steps) para mais resets e aprendizado mais rápido
 
 Uso:
     python train.py                       → Treina (continua se existir checkpoint)
@@ -32,7 +31,6 @@ import config
 
 
 def make_env(rank, seed=0):
-    """Factory para SubprocVecEnv — cada processo recebe seu próprio PyBoy."""
     def _init():
         from environment import ZeldaLinksAwakeningEnv
         env = ZeldaLinksAwakeningEnv(render_mode="null")
@@ -43,13 +41,6 @@ def make_env(rank, seed=0):
 
 
 class ZeldaLogCallback(BaseCallback):
-    """
-    Callback de logging detalhado para TensorBoard.
-
-    Registra todas as métricas de progresso do Zelda para
-    visualização em tempo real durante o treinamento.
-    """
-
     def __init__(self, num_envs, verbose=0):
         super().__init__(verbose)
         self.num_envs = num_envs
@@ -77,16 +68,17 @@ class ZeldaLogCallback(BaseCallback):
             self.best_instruments = max(self.best_instruments, instruments)
             self.best_screens = max(self.best_screens, screens)
 
-            # Console output
             print(
                 f"[EP {self.episode_count:>4}] "
                 f"Env {i:>2}/{self.num_envs} | "
                 f"Steps: {self.num_timesteps:>9,} | "
                 f"Scr: {screens:>3} | "
                 f"Trans: {info.get('screen_transitions', 0):>4} | "
+                f"WI: {info.get('world_interactions', 0):>3} | "
                 f"Inst: {instruments}/8 | "
                 f"Items: {info.get('inventory_count', 0):>2} | "
                 f"Kills: {info.get('kills', 0):>3} | "
+                f"Ent: {info.get('entities', 0):>2} | "
                 f"Deaths: {info.get('deaths', 0):>2} | "
                 f"Rupees: {info.get('rupees', 0):>3} | "
                 f"HP: {info.get('hp_fraction', 0):.0%} | "
@@ -94,34 +86,29 @@ class ZeldaLogCallback(BaseCallback):
                 f"FPS: {fps:>5.0f}"
             )
 
-            # --- TensorBoard: Progresso Principal ---
+            # --- TensorBoard ---
             self.logger.record("zelda/instruments", instruments)
             self.logger.record("zelda/best_instruments", self.best_instruments)
             self.logger.record("zelda/screens_explored", screens)
             self.logger.record("zelda/best_screens", self.best_screens)
             self.logger.record("zelda/total_screens_visited", info.get("total_screens_visited", 0))
             self.logger.record("zelda/dungeon_rooms", info.get("dungeon_rooms", 0))
-
-            # --- TensorBoard: Inventário e Equipamento ---
+            self.logger.record("zelda/screen_transitions", info.get("screen_transitions", 0))
+            self.logger.record("zelda/world_interactions", info.get("world_interactions", 0))
             self.logger.record("zelda/inventory_count", info.get("inventory_count", 0))
             self.logger.record("zelda/sword_level", info.get("sword_level", 0))
             self.logger.record("zelda/shield_level", info.get("shield_level", 0))
             self.logger.record("zelda/max_hearts", info.get("max_hearts", 0))
             self.logger.record("zelda/dungeon_keys", info.get("dungeon_keys", 0))
-
-            # --- TensorBoard: Colecionáveis ---
+            self.logger.record("zelda/dungeon_flag_bits", info.get("dungeon_flag_bits", 0))
             self.logger.record("zelda/shells", info.get("shells", 0))
             self.logger.record("zelda/leaves", info.get("leaves", 0))
             self.logger.record("zelda/trading_item", info.get("trading_item", 0))
             self.logger.record("zelda/rupees", info.get("rupees", 0))
-
-            # --- TensorBoard: Saúde e Sobrevivência ---
             self.logger.record("zelda/hp_fraction", info.get("hp_fraction", 0))
             self.logger.record("zelda/deaths", info.get("deaths", 0))
             self.logger.record("zelda/kills", info.get("kills", 0))
-            self.logger.record("zelda/screen_transitions", info.get("screen_transitions", 0))
-
-            # --- TensorBoard: Componentes de Reward ---
+            self.logger.record("zelda/entities", info.get("entities", 0))
             self.logger.record("zelda/total_reward", info.get("total_reward", 0))
             self.logger.record("zelda/unique_positions", info.get("unique_positions", 0))
 
@@ -129,14 +116,13 @@ class ZeldaLogCallback(BaseCallback):
                 "explore_screen", "explore_room", "explore_count",
                 "screen_transition", "instruments", "new_items",
                 "equipment", "hearts", "dungeon_keys", "small_keys",
-                "dungeon_items", "shells", "leaves", "trading",
-                "kills", "rupees", "hp_recovery",
-                "time", "idle", "death", "health_loss", "stuck",
+                "dungeon_items", "dungeon_flags", "shells", "leaves",
+                "trading", "kills", "rupees", "hp_recovery",
+                "world_interact", "time", "idle", "death",
+                "health_loss", "stuck",
             ]:
-                val = info.get(f"rew_{key}", 0)
-                self.logger.record(f"reward/{key}", val)
+                self.logger.record(f"reward/{key}", info.get(f"rew_{key}", 0))
 
-            # --- TensorBoard: Performance ---
             self.logger.record("zelda/fps", fps)
             self.logger.record("zelda/episode", self.episode_count)
 
@@ -164,8 +150,6 @@ def find_latest_vecnormalize() -> str | None:
 
 
 class SaveVecNormalizeCallback(BaseCallback):
-    """Salva o VecNormalize junto com os checkpoints do modelo."""
-
     def __init__(self, save_freq, save_path, name_prefix="zelda_vecnorm", verbose=0):
         super().__init__(verbose)
         self.save_freq = save_freq
@@ -186,71 +170,63 @@ class SaveVecNormalizeCallback(BaseCallback):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Treinar Agente Zelda: Link's Awakening com RL"
-    )
+    parser = argparse.ArgumentParser(description="Treinar Zelda RL Agent")
     parser.add_argument("--fresh", action="store_true", help="Forçar treino do zero")
     parser.add_argument("--timesteps", type=int, default=config.TOTAL_TIMESTEPS)
-    parser.add_argument(
-        "--num-envs", type=int, default=config.NUM_ENVS,
-        help=f"Processos paralelos (default: {config.NUM_ENVS})",
-    )
+    parser.add_argument("--num-envs", type=int, default=config.NUM_ENVS)
     args = parser.parse_args()
 
     num_envs = args.num_envs
-    n_steps = config.N_STEPS
 
     print("=" * 70)
-    print("   ZELDA: LINK'S AWAKENING — TREINAMENTO RL (PPO)")
+    print("   ZELDA: LINK'S AWAKENING — RL TRAINING V3")
     print("=" * 70)
     print(f"  ROM: {config.ROM_PATH}")
     print(f"  Init state: {config.INIT_STATE_PATH}")
-    print(f"  Timesteps alvo: {args.timesteps:,}")
-    print(f"  Processos paralelos: {num_envs}")
-    print(f"  Episódio: {config.MAX_STEPS_PER_EPISODE:,} steps")
-    print(f"  PPO: n_steps={n_steps} × {num_envs} envs")
+    print(f"  Timesteps: {args.timesteps:,}")
+    print(f"  Envs: {num_envs}")
+    print(f"  Episode: {config.MAX_STEPS_PER_EPISODE:,} steps")
+    print(f"  PPO: n_steps={config.N_STEPS} × {num_envs} envs")
     print(f"       batch={config.BATCH_SIZE} epochs={config.N_EPOCHS}")
     print(f"       gamma={config.GAMMA} ent={config.ENT_COEF} lr={config.LEARNING_RATE}")
-    print(f"  Reward: scale={config.REWARD_SCALE} time_penalty={config.TIME_PENALTY}")
+    print(f"  Reward: scale={config.REWARD_SCALE} time_penalty={config.TIME_PENALTY_BASE}")
     print(f"  Normalização: obs={config.NORMALIZE_OBS} reward={config.NORMALIZE_REWARD}")
+    print(f"  Anti-oscillation cooldown: {config.SCREEN_TRANSITION_COOLDOWN}")
+    print(f"  Game Over auto-continue after {config.GAME_OVER_WAIT_STEPS} steps")
     print("=" * 70)
 
-    # 1. Cria ambientes paralelos
     print(f"\n[SETUP] Criando {num_envs} ambientes paralelos...")
     vec_env = SubprocVecEnv([make_env(i) for i in range(num_envs)])
 
-    # VecNormalize — normaliza observações e rewards (técnica essencial de RL moderno)
     latest_vecnorm = None if args.fresh else find_latest_vecnormalize()
     if latest_vecnorm:
         print(f"[SETUP] Carregando VecNormalize: {latest_vecnorm}")
         env = VecNormalize.load(latest_vecnorm, vec_env)
         env.training = True
     else:
-        # Apenas espaços Box podem ser normalizados; MultiBinary/MultiDiscrete ficam intactos
         norm_keys = [
-            "screens", "health", "position", "equipment",
-            "overworld_map", "dungeon_state", "held_items", "game_progress",
+            "health", "position", "equipment",
+            "dungeon_state", "held_items", "game_progress",
+            "combat_info", "ammo",
         ]
         env = VecNormalize(
             vec_env,
             norm_obs=config.NORMALIZE_OBS,
             norm_obs_keys=norm_keys,
             norm_reward=config.NORMALIZE_REWARD,
-            clip_reward=config.REWARD_CLIP,
             gamma=config.GAMMA,
         )
 
     print(f"[SETUP] {num_envs} Game Boys rodando!")
 
-    # 2. Cria ou carrega modelo
     latest_model = None if args.fresh else find_latest_checkpoint()
 
     if latest_model:
-        print(f"[SETUP] Continuando do checkpoint: {latest_model}")
+        print(f"[SETUP] Continuando: {latest_model}")
         model = PPO.load(latest_model, env=env)
-        model.n_steps = n_steps
+        model.n_steps = config.N_STEPS
         model.n_envs = num_envs
-        model.rollout_buffer.buffer_size = n_steps
+        model.rollout_buffer.buffer_size = config.N_STEPS
         model.rollout_buffer.n_envs = num_envs
         model.rollout_buffer.reset()
     else:
@@ -259,7 +235,7 @@ def main():
             "MultiInputPolicy",
             env,
             learning_rate=config.LEARNING_RATE,
-            n_steps=n_steps,
+            n_steps=config.N_STEPS,
             batch_size=config.BATCH_SIZE,
             n_epochs=config.N_EPOCHS,
             gamma=config.GAMMA,
@@ -276,21 +252,13 @@ def main():
     print(f"\n[SETUP] Política: {type(model.policy).__name__}")
     print(f"[SETUP] Parâmetros: {total_params:,}")
 
-    # 3. Callbacks
     save_freq = max(config.SAVE_FREQUENCY // num_envs, 1)
-
     checkpoint_cb = CheckpointCallback(
-        save_freq=save_freq,
-        save_path=config.MODEL_DIR,
-        name_prefix="zelda_ppo",
+        save_freq=save_freq, save_path=config.MODEL_DIR, name_prefix="zelda_ppo",
     )
-    vecnorm_cb = SaveVecNormalizeCallback(
-        save_freq=save_freq,
-        save_path=config.MODEL_DIR,
-    )
+    vecnorm_cb = SaveVecNormalizeCallback(save_freq=save_freq, save_path=config.MODEL_DIR)
     log_cb = ZeldaLogCallback(num_envs=num_envs)
 
-    # 4. TREINA!
     print(f"\n[TREINO] Iniciando... (Ctrl+C para parar e salvar)\n")
     print(f"[TREINO] TensorBoard: tensorboard --logdir {config.LOG_DIR}\n")
     try:
@@ -303,13 +271,11 @@ def main():
     except KeyboardInterrupt:
         print("\n\n[TREINO] Interrompido pelo usuário.")
 
-    # 5. Salva modelo final + normalizador
     final_path = os.path.join(config.MODEL_DIR, "zelda_ppo_final")
     model.save(final_path)
     env.save(os.path.join(config.MODEL_DIR, "zelda_vecnorm_final.pkl"))
     print(f"\n[TREINO] Modelo salvo: {final_path}.zip")
     print(f"[TREINO] VecNormalize salvo: zelda_vecnorm_final.pkl")
-    print("[TREINO] Para continuar: python train.py")
 
     env.close()
 
