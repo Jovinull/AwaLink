@@ -79,9 +79,9 @@ class ZeldaLinksAwakeningEnv(gym.Env):
             "equipment": spaces.Box(low=0, high=1, shape=(6,), dtype=np.float32),
             "instruments": spaces.MultiBinary(mem.NUM_INSTRUMENTS),
             "overworld_map": spaces.Box(
-                low=0, high=255,
-                shape=(OVERWORLD_SHAPE[0], OVERWORLD_SHAPE[1], 1),
-                dtype=np.uint8,
+                low=0.0, high=1.0,
+                shape=(OVERWORLD_SHAPE[0] * OVERWORLD_SHAPE[1],),
+                dtype=np.float32,
             ),
             "dungeon_state": spaces.Box(low=0, high=1, shape=(8,), dtype=np.float32),
             "held_items": spaces.Box(low=0, high=1, shape=(2,), dtype=np.float32),
@@ -286,7 +286,8 @@ class ZeldaLinksAwakeningEnv(gym.Env):
         ], dtype=np.int8)
 
     def _get_overworld_map_obs(self):
-        return build_overworld_exploration_map(self._read_m)[:, :, np.newaxis]
+        raw = build_overworld_exploration_map(self._read_m)
+        return (raw.flatten() / 255.0).astype(np.float32)
 
     def _get_dungeon_state_obs(self):
         cat = self._read_m(mem.MAP_CATEGORY)

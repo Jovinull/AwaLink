@@ -205,7 +205,7 @@ def main():
         env.training = True
     else:
         norm_keys = [
-            "health", "position", "equipment",
+            "health", "position", "equipment", "overworld_map",
             "dungeon_state", "held_items", "game_progress",
             "combat_info", "ammo",
         ]
