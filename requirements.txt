@@ -1,0 +1,20 @@
+# ==========================================
+# Zelda: Link's Awakening AI — Reinforcement Learning
+# PPO com PyBoy, Stable-Baselines3 e TensorBoard
+# ==========================================
+
+# Emulador Game Boy
+pyboy>=2.7.0
+pillow>=12.0.0
+
+# RL Framework
+stable-baselines3>=2.7.0
+gymnasium>=1.2.0
+
+# Machine Learning
+torch>=2.0.0
+numpy>=2.0.0
+
+# Logging e Visualização
+tensorboard>=2.0.0
+tqdm>=4.60.0

@@ -1,0 +1,34 @@
+# Dependências e cache
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+*.egg-info/
+
+# Modelos treinados (podem ser grandes)
+models/
+
+# Logs do TensorBoard
+logs/
+
+# Sessão
+session/
+
+# Save states do emulador
+*.state
+
+# Arquivos de save do jogo
+*.ram
+*.rtc
+
+# ROMs (não devem ser commitadas por questões legais)
+*.gb
+*.gbc
+*.gba
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
