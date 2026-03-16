@@ -1,17 +1,13 @@
 """
 environment.py — Gymnasium Environment para Zelda: Link's Awakening via PyBoy.
 
-V3 — Melhorias de nível senior:
-  - Episódios curtos (~30k steps) para mais resets e aprendizado mais rápido
-  - Anti-oscillation em screen transitions (cooldown de N rooms)
-  - Auto-navegação do menu de Game Over (aperta A automaticamente)
-  - Detecção de interação com o mundo via hash dos tile data (D700-D79B)
-  - Observação de combate: contagem de entidades, power-up ativo, direção do Link
-  - Observação de ammo: bombas/flechas/pó normalizados
-  - Dungeon flags tracking (DB16-DB3D) para progresso em dungeons
-  - Explore count cortado em 100 visitas (reduz ruído no sinal)
-  - BCD parsing robusto para rupees/ammo
-  - Reward normalization manual (sem VecNormalize reward)
+V4 — Correções estruturais:
+  - Overworld map como imagem 2D (16×16×1) para processamento por CNN
+  - Exploration decay contínuo sem cutoff abrupto (0.03/√visits, sem limite)
+  - Curriculum learning em 3 fases (exploração → combate → dungeons)
+  - Recompensas rebalanceadas (hierarquia comprimida ~8x)
+  - Time penalty 10x mais forte para pressão por eficiência
+  - Anti-oscillation, auto Game Over, detecção de interação preservados
 """
 import math
 import numpy as np
@@ -80,7 +76,7 @@ class ZeldaLinksAwakeningEnv(gym.Env):
             "instruments": spaces.MultiBinary(mem.NUM_INSTRUMENTS),
             "overworld_map": spaces.Box(
                 low=0.0, high=1.0,
-                shape=(OVERWORLD_SHAPE[0] * OVERWORLD_SHAPE[1],),
+                shape=(OVERWORLD_SHAPE[0], OVERWORLD_SHAPE[1], 1),
                 dtype=np.float32,
             ),
             "dungeon_state": spaces.Box(low=0, high=1, shape=(8,), dtype=np.float32),
@@ -165,6 +161,9 @@ class ZeldaLinksAwakeningEnv(gym.Env):
         self.last_room = self._read_m(mem.MAP_ROOM)
         self.screen_transitions = 0
         self.world_interactions = 0
+
+        # Curriculum
+        self.curriculum_phase = 1
 
         self.total_reward = 0.0
         self.cumulative_rewards = {
@@ -287,7 +286,7 @@ class ZeldaLinksAwakeningEnv(gym.Env):
 
     def _get_overworld_map_obs(self):
         raw = build_overworld_exploration_map(self._read_m)
-        return (raw.flatten() / 255.0).astype(np.float32)
+        return (raw[:, :, np.newaxis] / 255.0).astype(np.float32)
 
     def _get_dungeon_state_obs(self):
         cat = self._read_m(mem.MAP_CATEGORY)
@@ -342,6 +341,15 @@ class ZeldaLinksAwakeningEnv(gym.Env):
     # REWARD SYSTEM V3
     # ===========================
 
+    def _update_curriculum_phase(self):
+        """Atualiza fase do curriculum baseado no progresso do agente."""
+        if self.curriculum_phase == 1:
+            if self.prev_explored_count >= config.CURRICULUM_PHASE_2_SCREENS:
+                self.curriculum_phase = 2
+        if self.curriculum_phase == 2:
+            if len(self.prev_inventory) >= config.CURRICULUM_PHASE_3_ITEMS:
+                self.curriculum_phase = 3
+
     def _compute_reward(self) -> float:
         r = 0.0
         cur_health_raw = self._read_m(mem.CURRENT_HEALTH)
@@ -349,6 +357,9 @@ class ZeldaLinksAwakeningEnv(gym.Env):
         cur_room = self._read_m(mem.MAP_ROOM)
         cur_x = self._read_m(mem.LINK_X)
         cur_y = self._read_m(mem.LINK_Y)
+
+        self._update_curriculum_phase()
+        phase = self.curriculum_phase
 
         # ---- MORTE (HP → 0) ----
         if cur_health_raw == 0 and self.prev_health_raw > 0:
@@ -368,11 +379,13 @@ class ZeldaLinksAwakeningEnv(gym.Env):
             return r * config.REWARD_SCALE
 
         # ---- SCREEN TRANSITION (anti-oscillation) ----
+        explore_mult = config.CURRICULUM_EXPLORE_MULTIPLIER if phase == 1 else 1.0
         if cur_room != self.prev_room:
             cooldown = self.recent_rooms[-config.SCREEN_TRANSITION_COOLDOWN:]
             if cur_room not in cooldown:
-                r += config.SCREEN_TRANSITION_REWARD
-                self.cumulative_rewards["screen_transition"] += config.SCREEN_TRANSITION_REWARD
+                val = config.SCREEN_TRANSITION_REWARD * explore_mult
+                r += val
+                self.cumulative_rewards["screen_transition"] += val
             self.screen_transitions += 1
             self.recent_rooms.append(cur_room)
             if len(self.recent_rooms) > 30:
@@ -394,10 +407,11 @@ class ZeldaLinksAwakeningEnv(gym.Env):
             self.cumulative_rewards["hp_recovery"] += val
 
         # ---- KILL COUNTERS ----
+        combat_mult = config.CURRICULUM_COMBAT_MULTIPLIER if phase == 2 else 1.0
         cur_kills = self._get_kill_counter()
         delta_kills = cur_kills - self.prev_kill_counter
         if delta_kills > 0:
-            val = delta_kills * config.KILL_BONUS
+            val = delta_kills * config.KILL_BONUS * combat_mult
             r += val
             self.cumulative_rewards["kills"] += val
             self.total_kills_detected += delta_kills
@@ -415,24 +429,26 @@ class ZeldaLinksAwakeningEnv(gym.Env):
         cur_explored = count_explored_screens(self._read_m)
         delta_screens = cur_explored - self.prev_explored_count
         if delta_screens > 0:
-            val = delta_screens * config.EXPLORE_NEW_SCREEN
+            val = delta_screens * config.EXPLORE_NEW_SCREEN * explore_mult
             r += val
             self.cumulative_rewards["explore_screen"] += val
         self.prev_explored_count = cur_explored
 
         # ---- DUNGEON ROOMS ----
+        dungeon_mult = config.CURRICULUM_DUNGEON_MULTIPLIER if phase == 3 else 1.0
         if self._read_m(mem.MAP_CATEGORY) == 0x01:
             room_key = (self._read_m(mem.MAP_DUNGEON_ID), self._read_m(mem.MAP_ROOM))
             if room_key not in self.visited_dungeon_rooms:
                 self.visited_dungeon_rooms.add(room_key)
-                r += config.EXPLORE_NEW_ROOM
-                self.cumulative_rewards["explore_room"] += config.EXPLORE_NEW_ROOM
+                val = config.EXPLORE_NEW_ROOM * dungeon_mult
+                r += val
+                self.cumulative_rewards["explore_room"] += val
 
-        # ---- EXPLORE COUNT BONUS (capped at 100 visits) ----
+        # ---- EXPLORE COUNT BONUS (continuous decay, no cutoff) ----
         pos_key = self._get_position_key()
         visit_count = self.visited_positions.get(pos_key, 0)
-        if 0 < visit_count < config.EXPLORE_COUNT_MAX_VISITS:
-            val = config.EXPLORE_COUNT_BONUS / math.sqrt(visit_count)
+        if visit_count > 0:
+            val = config.EXPLORE_COUNT_BONUS / math.sqrt(visit_count) * explore_mult
             r += val
             self.cumulative_rewards["explore_count"] += val
 
@@ -440,7 +456,7 @@ class ZeldaLinksAwakeningEnv(gym.Env):
         cur_dfb = self._count_dungeon_flag_bits()
         delta_dfb = cur_dfb - self.prev_dungeon_flag_bits
         if delta_dfb > 0:
-            val = delta_dfb * config.DUNGEON_FLAGS_REWARD
+            val = delta_dfb * config.DUNGEON_FLAGS_REWARD * dungeon_mult
             r += val
             self.cumulative_rewards["dungeon_flags"] += val
         self.prev_dungeon_flag_bits = cur_dfb
@@ -449,7 +465,7 @@ class ZeldaLinksAwakeningEnv(gym.Env):
         cur_instruments = self._count_instruments()
         delta_inst = cur_instruments - self.prev_instruments
         if delta_inst > 0:
-            val = delta_inst * config.INSTRUMENT_REWARD
+            val = delta_inst * config.INSTRUMENT_REWARD * dungeon_mult
             r += val
             self.cumulative_rewards["instruments"] += val
         self.prev_instruments = cur_instruments
@@ -458,7 +474,7 @@ class ZeldaLinksAwakeningEnv(gym.Env):
         cur_inv = self._get_inventory_set()
         new_items = cur_inv - self.prev_inventory
         if new_items:
-            val = len(new_items) * config.NEW_ITEM_REWARD
+            val = len(new_items) * config.NEW_ITEM_REWARD * combat_mult
             r += val
             self.cumulative_rewards["new_items"] += val
         self.prev_inventory = cur_inv
@@ -471,8 +487,9 @@ class ZeldaLinksAwakeningEnv(gym.Env):
         ]:
             cur = self._read_m(addr)
             if cur > getattr(self, attr):
-                r += config.EQUIPMENT_UPGRADE
-                self.cumulative_rewards["equipment"] += config.EQUIPMENT_UPGRADE
+                val = config.EQUIPMENT_UPGRADE * combat_mult
+                r += val
+                self.cumulative_rewards["equipment"] += val
             setattr(self, attr, cur)
 
         # ---- HEART CONTAINERS ----
@@ -714,6 +731,7 @@ class ZeldaLinksAwakeningEnv(gym.Env):
             "current_room": self._read_m(mem.MAP_ROOM),
             "total_reward": self.total_reward,
             "unique_positions": len(self.visited_positions),
+            "curriculum_phase": self.curriculum_phase,
             **{f"rew_{k}": v for k, v in self.cumulative_rewards.items()},
         }
 
