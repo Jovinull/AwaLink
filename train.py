@@ -1,11 +1,12 @@
 """
 train.py — Treinamento Paralelo com PPO para Zelda: Link's Awakening.
 
-V3:
+V4:
+  - Custom feature extractor: mini-CNN para overworld_map (16×16×1)
   - Normalização apenas em observações Box escalares (sem screens/overworld_map)
   - Sem normalização de reward (escala manual preserva hierarquia)
   - Métricas completas no TensorBoard (world interactions, entities, dungeon flags)
-  - Episódios curtos (~30k steps) para mais resets e aprendizado mais rápido
+  - Curriculum phase logging
 
 Uso:
     python train.py                       → Treina (continua se existir checkpoint)
@@ -18,6 +19,11 @@ import os
 import glob
 import time
 
+import numpy as np
+import gymnasium as gym
+import torch
+import torch.nn as nn
+
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
 from stable_baselines3.common.utils import set_random_seed
@@ -26,8 +32,102 @@ from stable_baselines3.common.callbacks import (
     BaseCallback,
     CallbackList,
 )
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from stable_baselines3.common.preprocessing import get_flattened_obs_dim
 
 import config
+
+
+class ZeldaFeaturesExtractor(BaseFeaturesExtractor):
+    """
+    Custom feature extractor que processa:
+      - screens (72×80×4) via NatureCNN padrão
+      - overworld_map (16×16×1) via mini-CNN dedicada
+      - demais observações via MLP (flatten + linear)
+    """
+
+    def __init__(self, observation_space: gym.spaces.Dict):
+        # Calcular dimensão total das features antes de chamar super()
+        # NatureCNN para screens: 512 features
+        # Mini-CNN para overworld_map: 64 features
+        # MLP para escalares: soma das dimensões flat
+        scalar_keys = [
+            k for k in observation_space.spaces
+            if k not in ("screens", "overworld_map")
+        ]
+        scalar_dim = sum(
+            get_flattened_obs_dim(observation_space.spaces[k])
+            for k in scalar_keys
+        )
+        features_dim = 512 + 64 + scalar_dim
+
+        super().__init__(observation_space, features_dim=features_dim)
+
+        self.scalar_keys = scalar_keys
+
+        # NatureCNN para screens
+        # SB3 aplica VecTransposeImage que converte HWC→CHW no obs_space e nos dados
+        # Então observation_space já tem screens como (C, H, W) = (4, 72, 80)
+        screens_shape = observation_space.spaces["screens"].shape  # (C, H, W) after VecTransposeImage
+        n_channels = screens_shape[0]
+        self.screens_cnn = nn.Sequential(
+            nn.Conv2d(n_channels, 32, kernel_size=8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+        with torch.no_grad():
+            sample = torch.zeros(1, *screens_shape)
+            cnn_out = self.screens_cnn(sample)
+            cnn_flat = cnn_out.shape[1]
+        self.screens_linear = nn.Sequential(
+            nn.Linear(cnn_flat, 512),
+            nn.ReLU(),
+        )
+
+        # Mini-CNN para overworld_map (16×16×1)
+        # overworld_map é float32 → SB3 NÃO transpõe, chega como HWC
+        self.map_cnn = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(16, 32, kernel_size=3, stride=2),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+        with torch.no_grad():
+            map_shape = observation_space.spaces["overworld_map"].shape  # (16, 16, 1) HWC
+            sample = torch.zeros(1, 1, map_shape[0], map_shape[1])  # CHW
+            map_out = self.map_cnn(sample)
+            map_flat = map_out.shape[1]
+        self.map_linear = nn.Sequential(
+            nn.Linear(map_flat, 64),
+            nn.ReLU(),
+        )
+
+    def forward(self, observations):
+        # Screens: já CHW via VecTransposeImage, já /255 via preprocess_obs
+        screens = observations["screens"]
+        screen_features = self.screens_linear(self.screens_cnn(screens))
+
+        # Overworld map: float32, NÃO transposto pelo SB3 → HWC→CHW
+        ow_map = observations["overworld_map"]
+        if ow_map.dim() == 4:
+            ow_map = ow_map.permute(0, 3, 1, 2)
+        map_features = self.map_linear(self.map_cnn(ow_map))
+
+        # Escalares: flatten e concatenar
+        scalar_parts = []
+        for key in self.scalar_keys:
+            obs = observations[key].float()
+            if obs.dim() > 2:
+                obs = obs.reshape(obs.shape[0], -1)
+            scalar_parts.append(obs)
+        scalars = torch.cat(scalar_parts, dim=1)
+
+        return torch.cat([screen_features, map_features, scalars], dim=1)
 
 
 def make_env(rank, seed=0):
@@ -111,6 +211,7 @@ class ZeldaLogCallback(BaseCallback):
             self.logger.record("zelda/entities", info.get("entities", 0))
             self.logger.record("zelda/total_reward", info.get("total_reward", 0))
             self.logger.record("zelda/unique_positions", info.get("unique_positions", 0))
+            self.logger.record("zelda/curriculum_phase", info.get("curriculum_phase", 1))
 
             for key in [
                 "explore_screen", "explore_room", "explore_count",
@@ -187,7 +288,7 @@ def main():
         print("[FRESH] Modelos e logs antigos removidos.\n")
 
     print("=" * 70)
-    print("   ZELDA: LINK'S AWAKENING — RL TRAINING V3")
+    print("   ZELDA: LINK'S AWAKENING — RL TRAINING V4")
     print("=" * 70)
     print(f"  ROM: {config.ROM_PATH}")
     print(f"  Init state: {config.INIT_STATE_PATH}")
@@ -201,6 +302,8 @@ def main():
     print(f"  Normalização: obs={config.NORMALIZE_OBS} reward={config.NORMALIZE_REWARD}")
     print(f"  Anti-oscillation cooldown: {config.SCREEN_TRANSITION_COOLDOWN}")
     print(f"  Game Over auto-continue after {config.GAME_OVER_WAIT_STEPS} steps")
+    print(f"  Curriculum: phase2@{config.CURRICULUM_PHASE_2_SCREENS}scr, phase3@{config.CURRICULUM_PHASE_3_ITEMS}items")
+    print(f"  Feature extractor: ZeldaFeaturesExtractor (NatureCNN + MapCNN + MLP)")
     print("=" * 70)
 
     print(f"\n[SETUP] Criando {num_envs} ambientes paralelos...")
@@ -213,7 +316,7 @@ def main():
         env.training = True
     else:
         norm_keys = [
-            "health", "position", "equipment", "overworld_map",
+            "health", "position", "equipment",
             "dungeon_state", "held_items", "game_progress",
             "combat_info", "ammo",
         ]
@@ -229,9 +332,13 @@ def main():
 
     latest_model = None if args.fresh else find_latest_checkpoint()
 
+    policy_kwargs = dict(
+        features_extractor_class=ZeldaFeaturesExtractor,
+    )
+
     if latest_model:
         print(f"[SETUP] Continuando: {latest_model}")
-        model = PPO.load(latest_model, env=env)
+        model = PPO.load(latest_model, env=env, custom_objects={"policy_kwargs": policy_kwargs})
         model.n_steps = config.N_STEPS
         model.n_envs = num_envs
         model.rollout_buffer.buffer_size = config.N_STEPS
@@ -254,6 +361,7 @@ def main():
             max_grad_norm=config.MAX_GRAD_NORM,
             tensorboard_log=config.LOG_DIR,
             verbose=config.VERBOSE,
+            policy_kwargs=policy_kwargs,
         )
 
     total_params = sum(p.numel() for p in model.policy.parameters())
